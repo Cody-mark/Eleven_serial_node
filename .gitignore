@@ -1,2 +1,5 @@
 /build
 .vscode
+/eleven_serial_node/log
+/log
+/photos
