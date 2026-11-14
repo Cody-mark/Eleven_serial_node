@@ -1,7 +1,10 @@
 #include <eleven_serial_node/ros2_mcu.h>
+
+#include <algorithm>
 #include <chrono>
-#include <cstring>
+#include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace Eleven
 {
@@ -9,174 +12,438 @@ namespace Eleven
         : node_(node)
     {
         serial_port_ = port;
+
         if (!node_->has_parameter("baud"))
         {
             node_->declare_parameter("baud", 115200);       // 先声明后使用
         }
         serial_baud_ = static_cast<int>(node_->get_parameter("baud").as_int());
 
-        const drivers::serial_driver::SerialPortConfig config(
-            static_cast<uint32_t>(serial_baud_),
-            drivers::serial_driver::FlowControl::NONE,          // 无流控   
-            drivers::serial_driver::Parity::NONE,               // 无校验
-            drivers::serial_driver::StopBits::ONE);             // 1位停止位
-
-        while (rclcpp::ok())
+        if (!node_->has_parameter("tx_queue_size"))
         {
-            try
-            {
-                port_ = std::make_unique<drivers::serial_driver::SerialPort>(
-                    io_context_, serial_port_, config);
-                port_->open();
-                if (port_->is_open())
-                    break;
-            }
-            catch (const std::exception& e)
-            {
-                RCLCPP_WARN(node_->get_logger(), "try to open port %s failed: %s",
-                            serial_port_.c_str(), e.what());
-            }
+            node_->declare_parameter("tx_queue_size", 4);
+        }
+        const int queue_size = static_cast<int>(node_->get_parameter("tx_queue_size").as_int());
+        tx_queue_capacity_ = queue_size > 0 ? static_cast<size_t>(queue_size) : 1;
+
+        while (rclcpp::ok() && !try_open())
+        {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
-        if (!port_ || !port_->is_open())
+        if (!connected_)
         {
             RCLCPP_ERROR(node_->get_logger(), "failed to open port %s", serial_port_.c_str());
             return;
         }
-        RCLCPP_INFO(node_->get_logger(), "port open success");
 
-        // 异步接收，回调中把数据追加到接收缓冲（回调由 io_context 线程执行）
-        port_->async_receive([this](std::vector<uint8_t>& buff, const size_t& size)
-        {
-            std::lock_guard<std::mutex> lock(rx_mutex_);
-            rx_buffer_.insert(rx_buffer_.end(), buff.begin(), buff.begin() + size);
-        });
+        RCLCPP_INFO(node_->get_logger(), "port %s open success (%d baud)",
+                    serial_port_.c_str(), serial_baud_);
+
+        running_ = true;
+        rx_thread_ = std::thread(&serial_mcu::rx_loop, this);
+        tx_thread_ = std::thread(&serial_mcu::tx_loop, this);
     }
 
     serial_mcu::~serial_mcu()
     {
-        if (port_ && port_->is_open())
-            port_->close();
+        running_ = false;
+        tx_cv_.notify_all();
+
+        // serial_driver 的 send/receive 没有超时，关闭端口以解除阻塞
+        if (port_)
+        {
+            try
+            {
+                port_->close();
+            }
+            catch (const std::exception&)
+            {
+            }
+        }
+
+        if (tx_thread_.joinable())
+        {
+            tx_thread_.join();
+        }
+        if (rx_thread_.joinable())
+        {
+            rx_thread_.join();
+        }
     }
 
-    bool serial_mcu::isOpen() const
+    drivers::serial_driver::SerialPortConfig serial_mcu::make_config() const
     {
-        return port_ && port_->is_open();
+        return drivers::serial_driver::SerialPortConfig(
+            static_cast<uint32_t>(serial_baud_),                // 波特率
+            drivers::serial_driver::FlowControl::NONE,          // 无流控
+            drivers::serial_driver::Parity::NONE,               // 无校验
+            drivers::serial_driver::StopBits::ONE);             // 1位停止位
     }
 
-    size_t serial_mcu::serial_send(uint8_t frame_id, float msgs[], uint8_t length)
+    bool serial_mcu::try_open()
     {
-        const size_t data_len = static_cast<size_t>(length) * sizeof(float);
+        std::lock_guard<std::mutex> lock(port_mutex_);
+        try
+        {
+            if (port_)
+            {
+                try
+                {
+                    port_->close();
+                }
+                catch (const std::exception&)
+                {
+                }
+                port_.reset();
+            }
+
+            port_ = std::make_unique<drivers::serial_driver::SerialPort>(
+                io_context_, serial_port_, make_config());
+            port_->open();
+            if (!port_->is_open())
+            {
+                throw std::runtime_error("serial port is not open after open()");
+            }
+            connected_ = true;
+            rx_accum_.clear();
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            connected_ = false;
+            port_.reset();
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                                 "open %s failed: %s", serial_port_.c_str(), e.what());
+            return false;
+        }
+    }
+
+    void serial_mcu::close_port()
+    {
+        std::lock_guard<std::mutex> lock(port_mutex_);
+        connected_ = false;
+        if (port_)
+        {
+            try
+            {
+                if (port_->is_open())
+                {
+                    port_->close();
+                }
+            }
+            catch (const std::exception&)
+            {
+            }
+            port_.reset();
+        }
+    }
+
+    void serial_mcu::tx_loop()
+    {
+        while (running_)
+        {
+            std::vector<uint8_t> frame;
+            {
+                std::unique_lock<std::mutex> lock(tx_mutex_);
+                tx_cv_.wait(lock, [this] { return !running_ || !tx_queue_.empty(); });
+                if (!running_)
+                {
+                    return;
+                }
+                frame = std::move(tx_queue_.front());
+                tx_queue_.pop_front();
+            }
+
+            if (!connected_)
+            {
+                tx_dropped_++;
+                continue;
+            }
+
+            try
+            {
+                std::lock_guard<std::mutex> lock(port_mutex_);
+                if (!port_ || !port_->is_open())
+                {
+                    tx_dropped_++;
+                    continue;
+                }
+
+                const size_t sent = port_->send(frame);
+                if (sent == frame.size())
+                {
+                    tx_sent_++;
+                }
+                else
+                {
+                    // 短写会留下半帧，丢弃本帧并关端口，让阻塞中的 RX 线程醒来重连
+                    tx_dropped_++;
+                    connected_ = false;
+                    try
+                    {
+                        if (port_ && port_->is_open())
+                        {
+                            port_->close();
+                        }
+                    }
+                    catch (const std::exception&)
+                    {
+                    }
+                    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                                         "partial serial write: %zu / %zu", sent, frame.size());
+                }
+            }
+            catch (const std::exception& e)
+            {
+                if (!running_)
+                {
+                    return;
+                }
+                tx_dropped_++;
+                connected_ = false;
+                try
+                {
+                    if (port_ && port_->is_open())
+                    {
+                        port_->close();
+                    }
+                }
+                catch (const std::exception&)
+                {
+                }
+                RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                                     "serial send failed: %s", e.what());
+            }
+        }
+    }
+
+    void serial_mcu::rx_loop()
+    {
+        std::vector<uint8_t> chunk(512);
+
+        while (running_)
+        {
+            if (!connected_)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                if (!running_)
+                {
+                    break;
+                }
+                try_open();
+                continue;
+            }
+
+            try
+            {
+                const size_t got = port_->receive(chunk);
+                if (!running_)
+                {
+                    break;
+                }
+                if (got > 0)
+                {
+                    handle_rx_bytes(chunk.data(), got);
+                }
+            }
+            catch (const std::exception& e)
+            {
+                if (!running_)
+                {
+                    break;
+                }
+                connected_ = false;
+                RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                                     "serial receive failed: %s", e.what());
+                close_port();
+            }
+        }
+    }
+
+    bool serial_mcu::serial_send(uint8_t frame_id, const void* data, uint8_t data_len)
+    {
         if (data_len > MAX_PAYLOAD_LEN)
         {
-            RCLCPP_ERROR(node_->get_logger(), "Data too long: %d bytes (max %d)",
-                         static_cast<int>(data_len), MAX_PAYLOAD_LEN);
-            return 0;
+            RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                                  "data too long: %u bytes (max %zu)",
+                                  static_cast<unsigned>(data_len),
+                                  static_cast<size_t>(MAX_PAYLOAD_LEN));
+            return false;
         }
-        if (!isOpen())
+        if (data_len > 0 && data == nullptr)
         {
-            RCLCPP_ERROR(node_->get_logger(), "Serial port is not open.");
-            return 0;
+            return false;
+        }
+        if (!running_)
+        {
+            return false;
         }
 
-        std::vector<uint8_t> frame(data_len + 8, 0);
+        std::vector<uint8_t> frame =
+            build_frame(frame_id, static_cast<const uint8_t*>(data), data_len);
+
+        {
+            std::lock_guard<std::mutex> lock(tx_mutex_);
+            if (tx_queue_.size() >= tx_queue_capacity_)
+            {
+                tx_queue_.pop_front();      // 全局丢最旧
+                tx_dropped_++;
+            }
+            tx_queue_.push_back(std::move(frame));
+        }
+        tx_cv_.notify_one();
+        return true;
+    }
+
+    bool serial_mcu::serial_send(uint8_t frame_id, const float* msgs, uint8_t count)
+    {
+        if (static_cast<size_t>(count) > MAX_DATA_LENGTH)
+        {
+            RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                                  "too many floats: %u (max %zu)",
+                                  static_cast<unsigned>(count), MAX_DATA_LENGTH);
+            return false;
+        }
+        if (count > 0 && msgs == nullptr)
+        {
+            return false;
+        }
+        const uint8_t data_len = static_cast<uint8_t>(count * sizeof(float));
+        return serial_send(frame_id, static_cast<const void*>(msgs), data_len);
+    }
+
+    bool serial_mcu::serial_read(received_frame& out)
+    {
+        std::lock_guard<std::mutex> lock(rx_mutex_);
+        if (rx_frames_.empty())
+        {
+            return false;
+        }
+        out = std::move(rx_frames_.front());
+        rx_frames_.pop_front();
+        return true;
+    }
+
+    void serial_mcu::handle_rx_bytes(const uint8_t* data, size_t len)
+    {
+        constexpr size_t MAX_RX_ACCUM = 4096;   // 防止半帧/垃圾数据无限堆积
+
+        rx_accum_.insert(rx_accum_.end(), data, data + len);
+
+        while (rx_accum_.size() >= 4)
+        {
+            if (rx_accum_[0] != FRAME_HEAD_0 || rx_accum_[1] != FRAME_HEAD_1)
+            {
+                rx_accum_.erase(rx_accum_.begin());
+                rx_resync_bytes_++;
+                continue;
+            }
+
+            const uint8_t data_length = rx_accum_[3];
+            if (data_length > MAX_PAYLOAD_LEN)
+            {
+                rx_accum_.erase(rx_accum_.begin(), rx_accum_.begin() + 2);
+                rx_resync_bytes_ += 2;
+                continue;
+            }
+
+            const size_t frame_len = static_cast<size_t>(data_length) + FRAME_OVERHEAD;
+            if (rx_accum_.size() < frame_len)
+            {
+                break;      // 数据还没收全
+            }
+
+            const size_t crc_off = 4 + data_length;
+            if (rx_accum_[crc_off + 2] != FRAME_END_0 || rx_accum_[crc_off + 3] != FRAME_END_1)
+            {
+                rx_accum_.erase(rx_accum_.begin());
+                rx_resync_bytes_++;
+                continue;
+            }
+
+            const uint16_t recv_crc = static_cast<uint16_t>(
+                rx_accum_[crc_off] | (rx_accum_[crc_off + 1] << 8));
+            if (CRC16_Modbus(rx_accum_.data() + 2, 2 + data_length) != recv_crc)
+            {
+                // 长度字段可能已损坏，只丢掉帧头重新找同步，避免吞掉后面的好帧
+                rx_crc_errors_++;
+                rx_accum_.erase(rx_accum_.begin(), rx_accum_.begin() + 2);
+                rx_resync_bytes_ += 2;
+                continue;
+            }
+
+            received_frame frame;
+            frame.id = rx_accum_[2];
+            frame.len = data_length;
+            std::copy_n(rx_accum_.begin() + 4, data_length, frame.data.begin());
+            push_frame(std::move(frame));
+
+            rx_accum_.erase(rx_accum_.begin(), rx_accum_.begin() + frame_len);
+        }
+
+        if (rx_accum_.size() > MAX_RX_ACCUM)
+        {
+            const size_t excess = rx_accum_.size() - MAX_RX_ACCUM;
+            rx_accum_.erase(rx_accum_.begin(), rx_accum_.begin() + excess);
+            rx_resync_bytes_ += excess;
+        }
+    }
+
+    void serial_mcu::push_frame(received_frame&& frame)
+    {
+        std::lock_guard<std::mutex> lock(rx_mutex_);
+        if (rx_frames_.size() >= rx_frames_capacity_)
+        {
+            rx_frames_.pop_front();
+            rx_dropped_++;
+        }
+        rx_frames_.push_back(std::move(frame));
+    }
+
+    std::vector<uint8_t> serial_mcu::build_frame(uint8_t frame_id, const uint8_t* data,
+                                                 uint8_t data_len)
+    {
+        std::vector<uint8_t> frame(static_cast<size_t>(data_len) + FRAME_OVERHEAD, 0);
         frame[0] = FRAME_HEAD_0;
         frame[1] = FRAME_HEAD_1;
         frame[2] = frame_id;
-        frame[3] = static_cast<uint8_t>(data_len);
+        frame[3] = data_len;
 
-        for (int i = 0; i < length; i++)
+        if (data_len > 0)
         {
-            frameout_.data.msg_get[i] = msgs[i];
+            std::memcpy(&frame[4], data, data_len);
         }
-        std::memcpy(&frame[4], frameout_.data.buff_msg, data_len);
 
         // CRC16-Modbus 覆盖 ID + LEN + DATA
-        uint16_t crc = CRC16_Modbus(&frame[2], 2 + data_len);
+        const uint16_t crc = CRC16_Modbus(&frame[2], static_cast<size_t>(data_len) + 2);
         frame[4 + data_len] = static_cast<uint8_t>(crc & 0xFF);
         frame[5 + data_len] = static_cast<uint8_t>((crc >> 8) & 0xFF);
         frame[6 + data_len] = FRAME_END_0;
         frame[7 + data_len] = FRAME_END_1;
-
-        size_t sent = 0;
-        try
-        {
-            sent = port_->send(frame);
-        }
-        catch (const std::exception& e)
-        {
-            RCLCPP_ERROR(node_->get_logger(), "serial send failed: %s", e.what());
-            return 0;
-        }
-        RCLCPP_INFO(node_->get_logger(), "write %d", static_cast<int>(sent));
-        return sent;
+        return frame;
     }
 
-    bool serial_mcu::serial_read(uint8_t* received_frame_id, float msgs[], uint8_t* received_length)
+    float received_frame::as_float(size_t index) const
     {
-        if (!isOpen())
+        float value = 0.0f;
+        const size_t offset = index * sizeof(float);
+        if (offset + sizeof(float) <= len)
         {
-            RCLCPP_ERROR(node_->get_logger(), "Serial port is not open.");
-            return false;
+            std::memcpy(&value, data.data() + offset, sizeof(float));
         }
+        return value;
+    }
 
-        std::lock_guard<std::mutex> lock(rx_mutex_);
-
-        // 帧结构：head(2) + id(1) + len(1) + data(len) + crc(2) + tail(2)
-        while (rx_buffer_.size() >= 4)
+    uint32_t received_frame::as_u32(size_t index) const
+    {
+        uint32_t value = 0;
+        const size_t offset = index * sizeof(uint32_t);
+        if (offset + sizeof(uint32_t) <= len)
         {
-            if (rx_buffer_[0] != FRAME_HEAD_0 || rx_buffer_[1] != FRAME_HEAD_1)
-            {
-                rx_buffer_.erase(rx_buffer_.begin());
-                continue;
-            }
-
-            const uint8_t data_length = rx_buffer_[3];
-            if (data_length > MAX_PAYLOAD_LEN)
-            {
-                RCLCPP_WARN(node_->get_logger(), "Data too long: %d", data_length);
-                rx_buffer_.erase(rx_buffer_.begin(), rx_buffer_.begin() + 2);
-                continue;
-            }
-
-            const size_t frame_len = static_cast<size_t>(data_length) + 8;
-            if (rx_buffer_.size() < frame_len)
-            {
-                return false; // 数据还没收全，等下一次
-            }
-
-            const size_t crc_off = 4 + data_length;
-            if (rx_buffer_[crc_off + 2] != FRAME_END_0 || rx_buffer_[crc_off + 3] != FRAME_END_1)
-            {
-                rx_buffer_.erase(rx_buffer_.begin());
-                continue;
-            }
-
-            const uint16_t recv_crc =
-                static_cast<uint16_t>(rx_buffer_[crc_off] | (rx_buffer_[crc_off + 1] << 8));
-            if (CRC16_Modbus(&rx_buffer_[2], 2 + data_length) != recv_crc)
-            {
-                RCLCPP_WARN(node_->get_logger(), "CRC mismatch: id=%d len=%d",
-                            rx_buffer_[2], data_length);
-                rx_buffer_.erase(rx_buffer_.begin(), rx_buffer_.begin() + frame_len);
-                continue;
-            }
-
-            framein_.frame_id = rx_buffer_[2];
-            std::memcpy(framein_.data.buff_msg, &rx_buffer_[4], data_length);
-
-            *received_frame_id = framein_.frame_id;
-            *received_length = static_cast<uint8_t>(data_length / sizeof(float));
-            for (size_t i = 0; i < *received_length; ++i)
-            {
-                msgs[i] = framein_.data.msg_get[i];
-            }
-
-            rx_buffer_.erase(rx_buffer_.begin(), rx_buffer_.begin() + frame_len);
-            return true;
+            std::memcpy(&value, data.data() + offset, sizeof(uint32_t));
         }
-        return false;
+        return value;
     }
 
     uint16_t CRC16_Modbus(const uint8_t *p, size_t len)
