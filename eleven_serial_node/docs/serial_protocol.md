@@ -1,6 +1,6 @@
 # Eleven 串口通信协议
 
-本文档描述 `include/eleven_serial_node/serial_mcu.hpp` 收发的二进制帧格式。库只负责组帧、校验、拆帧和收发，**帧 ID 的业务含义由应用层（节点）和 MCU 固件共同约定**。
+本文档描述 `include/eleven_serial_node/serial_mcu.hpp` 收发的二进制帧格式。库只负责组帧、校验、拆帧和收发，**帧 ID 的业务含义由应用层（节点）和 下位机共同约定**。
 
 ## 1. 物理层
 
@@ -75,17 +75,7 @@ MCU 侧实现必须与此完全一致，否则会表现为“帧能收到但全�
 
 ## 5. 帧 ID
 
-库不解释 ID，只原样收发。建议在确定业务后补一张表，并与 MCU 固件保持同步。示例（**仅示意，不是本库的约定**）：
-
-| ID | 方向 | 含义 |
-|---|---|---|
-| 1 | MCU → 上位机 | 初始位姿 |
-| 1 | 上位机 → MCU | 检测框中心偏移 |
-| 2 | 上位机 → MCU | 实时位姿 |
-| 3 | 上位机 → MCU | 初始位姿确认 |
-| 4 | MCU → 上位机 | 两点坐标（测距请求） |
-| 5 | 上位机 → MCU | 两点距离 |
-| 6 | 上位机 → MCU | 位姿超时标志 |
+库不解释 ID，只原样收发。
 
 ## 6. 接收端的容错行为
 
@@ -123,32 +113,6 @@ MCU 侧实现必须与此完全一致，否则会表现为“帧能收到但全�
 
 日志直接输出到 `std::cout` / `std::cerr`，只在状态变化时打印（打开成功 / 首次打开失败 / 收发异常）。
 
-## 8. 使用示例
-
-```cpp
-#include <eleven_serial_node/serial_mcu.hpp>
-
-Eleven::serial_mcu link("/dev/ttyACM0", 115200);
-
-// 发送：ID=2，5 个 float
-float pose[5] = {1.0f, 2.0f, 30.0f, 1.0f, 1.0f};
-link.serial_send(2, pose, 5);
-
-// 接收：由调用方循环轮询
-Eleven::received_frame frame;
-if (link.serial_read(frame))
-{
-    if (frame.id == 1 && frame.len >= 12)
-    {
-        const float x = frame.as_float(0);
-        const float y = frame.as_float(1);
-        const float yaw = frame.as_float(2);
-    }
-}
-```
-
-在 ROS2 节点里使用时，把 `serial_read()` 放进定时器回调或主循环即可，库本身不依赖 `rclcpp`。
-
 ### 链路测试程序
 
 ```bash
@@ -157,10 +121,14 @@ ros2 run eleven_serial_node serial_link_test /dev/ttyACM0 100
 
 - 参数：`<port> [hz]`，hz 默认 100
 - 帧 ID `0x02`，载荷 20 字节：`x=1.0f, y=2.0f, yaw=30.0f`（固定值）+ `uint32 时间戳(ms)` + `uint32 seq`（每帧 +1）
-- 每秒打印一次 `tx_sent / tx_dropped / rx / open`，Ctrl-C 退出
+- 每发一帧打印一行 `[tx]`：`id / len / x / y / yaw / stamp / seq`（表示已入发送队列，不代表已写到线路上）
+- 每收到一帧解析并打印一行 `[rx]`：同样打印 ID、长度和解析出的字段；本测试帧字段对不上时追加 `[MISMATCH]`，其他 ID/长度的帧按十六进制打印 `data`
+- 每秒打印一次 `[stat]`：`tx_sent / tx_dropped / rx / rx_bad / crc_err / resync / rx_drop / open`
+- Ctrl-C 退出
 - 时间戳取 `system_clock` 毫秒，uint32 约 49.7 天回绕；只关心相对时间的话可改成程序启动计时
+- 注意：每帧都打印时 100Hz 约 200 行/秒、200Hz 约 400 行/秒；若终端成为瓶颈导致发送掉拍，可降低 hz 或重定向到文件观察
 
-## 9. 构建与依赖
+## 8. 构建与依赖
 
 - 头文件模式：所有实现都在 `serial_mcu.hpp`，不需要编译 `.so`
 - 依赖：`serial_driver`（ROS2 transport_drivers）、`Threads`
@@ -168,9 +136,9 @@ ros2 run eleven_serial_node serial_link_test /dev/ttyACM0 100
 - 复制到其他 ROS2 包：把 `serial_mcu.hpp` 复制到该包 include 目录，同样加上 serial_driver 的 include 和库即可
 - 注意：`serial_driver` 自身依赖 `rclcpp` / `rclcpp_lifecycle` / `std_msgs`，因此**非 ROS2 环境无法只靠复制头文件使用**；如需完全脱离 ROS，应把底层换成 asio/termios
 
-## 10. 与 serial_node 旧协议的区别
+## 9. 与 serial_node 旧协议的区别
 
-`serial_node`（ROS1）使用的是另一套帧格式，两者**不能直接互通**：
+`serial_node`（ROS1）是九期的通讯代码，使用的是另一套帧格式，两者**不能直接互通**：
 
 | 项目 | serial_node 旧协议 | 本协议 |
 |---|---|---|
@@ -179,4 +147,4 @@ ros2 run eleven_serial_node serial_link_test /dev/ttyACM0 100
 | 校验 | CRC16（CCITT 风格表），**只覆盖 DATA** | CRC16-Modbus，覆盖 **ID + LEN + DATA** |
 | 最大载荷 | 36 个 float（144 字节） | 64 字节（16 个 float） |
 
-对接 MCU 前务必确认固件使用的是哪一套。
+对接下位机前务必确认固件使用的是哪一套。
