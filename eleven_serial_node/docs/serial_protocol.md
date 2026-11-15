@@ -117,7 +117,9 @@ MCU 侧实现必须与此完全一致，否则会表现为“帧能收到但全�
 - `serial_read()` 是非阻塞的：队列为空返回 `false`，需要调用方轮询（例如放在节点的定时器/主循环里）
 - 串口未打开时，入队的帧会被 TX 线程直接丢弃并计入 `tx_dropped`
 - 打开失败不会阻塞构造，RX 线程每 200ms 尝试重连一次
-- 析构时置 `running_ = false`、加锁关闭端口以解除 RX 阻塞，join 两个线程之后再释放端口对象
+- 端口生命周期由 RX 线程独占：发送出错时 TX 线程只置断开标志并叫醒 RX，由 RX 关闭并重连
+- **析构**：`serial_driver` 的 `receive()`/`send()` 没有超时，且 Linux 下 `close()` 唤不醒阻塞中的 `poll()`，所以析构用 `SIGUSR1` 打断阻塞的系统调用（重复唤醒以覆盖信号早于阻塞的窗口），join 两个线程后才关闭并释放端口
+- 因此本类会在构造时安装**进程级 `SIGUSR1` 处理函数**（空实现，不设 `SA_RESTART`）；若你的程序自己要用 `SIGUSR1`，需要避开或改成本类内部的信号
 
 日志直接输出到 `std::cout` / `std::cerr`，只在状态变化时打印（打开成功 / 首次打开失败 / 收发异常）。
 
@@ -146,6 +148,17 @@ if (link.serial_read(frame))
 ```
 
 在 ROS2 节点里使用时，把 `serial_read()` 放进定时器回调或主循环即可，库本身不依赖 `rclcpp`。
+
+### 链路测试程序
+
+```bash
+ros2 run eleven_serial_node serial_link_test /dev/ttyACM0 100
+```
+
+- 参数：`<port> [hz]`，hz 默认 100
+- 帧 ID `0x02`，载荷 20 字节：`x=1.0f, y=2.0f, yaw=30.0f`（固定值）+ `uint32 时间戳(ms)` + `uint32 seq`（每帧 +1）
+- 每秒打印一次 `tx_sent / tx_dropped / rx / open`，Ctrl-C 退出
+- 时间戳取 `system_clock` 毫秒，uint32 约 49.7 天回绕；只关心相对时间的话可改成程序启动计时
 
 ## 9. 构建与依赖
 

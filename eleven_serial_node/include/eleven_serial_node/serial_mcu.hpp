@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -32,6 +34,18 @@ namespace Eleven
 inline constexpr std::size_t FRAME_OVERHEAD = 8;    // head(2) + id(1) + len(1) + crc(2) + tail(2)
 inline constexpr std::size_t MAX_FRAME_LEN = MAX_PAYLOAD_LEN + FRAME_OVERHEAD;
 
+// serial_driver 的 send/receive 没有超时，close() 也唤不醒阻塞中的同步读
+// （Linux 下 close 不会唤醒 poll），只能靠信号打断系统调用。
+inline void on_wakeup_signal(int) {}
+
+inline void wake_thread(std::thread& thread)
+{
+    if (thread.joinable())
+    {
+        pthread_kill(thread.native_handle(), SIGUSR1);
+    }
+}
+
 inline uint16_t CRC16_Modbus(const uint8_t *p, std::size_t len)
 {
     static const uint16_t CRC16ModbusTable[256] =
@@ -49,7 +63,7 @@ inline uint16_t CRC16_Modbus(const uint8_t *p, std::size_t len)
         0x3C00, 0xFCC1, 0xFD81, 0x3D40, 0xFF01, 0x3FC0, 0x3E80, 0xFE41,
         0xFA01, 0x3AC0, 0x3B80, 0xFB41, 0x3900, 0xF9C1, 0xF881, 0x3840,
         0x2800, 0xE8C1, 0xE981, 0x2940, 0xEB01, 0x2BC0, 0x2A80, 0xEA41,
-        0xEE01, 0x2EC1, 0x2F80, 0xEF41, 0x2D00, 0xEDC1, 0xEC81, 0x2C40,
+        0xEE01, 0x2EC0, 0x2F80, 0xEF41, 0x2D00, 0xEDC1, 0xEC81, 0x2C40,
         0xE401, 0x24C0, 0x2580, 0xE541, 0x2700, 0xE7C1, 0xE681, 0x2640,
         0x2200, 0xE2C1, 0xE381, 0x2340, 0xE101, 0x21C0, 0x2080, 0xE041,
         0xA001, 0x60C0, 0x6180, 0xA141, 0x6300, 0xA3C1, 0xA281, 0x6240,
@@ -151,6 +165,8 @@ private:
 
     std::atomic<bool> running_{false};
     std::atomic<bool> connected_{false};
+    std::atomic<bool> tx_exited_{false};
+    std::atomic<bool> rx_exited_{false};
 
     std::thread tx_thread_;
     std::thread rx_thread_;
@@ -179,6 +195,15 @@ inline serial_mcu::serial_mcu(const std::string& port, int baud)
     serial_port_ = port;
     serial_baud_ = baud;
 
+    // 本类用 SIGUSR1 唤醒阻塞中的收发线程；不设 SA_RESTART，系统调用才会返回 EINTR
+    struct sigaction action = {};
+    action.sa_handler = on_wakeup_signal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    sigaction(SIGUSR1, &action, nullptr);
+
+    running_ = true;
+
     // 只尝试一次；失败时由 rx_loop 在后台按 200ms 间隔重连
     if (!try_open())
     {
@@ -186,7 +211,6 @@ inline serial_mcu::serial_mcu(const std::string& port, int baud)
                   << ", retrying in background" << std::endl;
     }
 
-    running_ = true;
     rx_thread_ = std::thread(&serial_mcu::rx_loop, this);
     tx_thread_ = std::thread(&serial_mcu::tx_loop, this);
 }
@@ -196,30 +220,27 @@ inline serial_mcu::~serial_mcu()
     running_ = false;
     tx_cv_.notify_all();
 
-    // serial_driver 的 send/receive 没有超时，关闭端口以解除阻塞。
-    // 这里只 close、不 reset：RX 线程可能正阻塞在 port_->receive() 里，
-    // 提前 reset 会让它持有悬空指针。reset 放到两个线程 join 之后。
+    // 重复唤醒，覆盖“信号早于线程进入阻塞调用”的时间窗口
+    while (!rx_exited_ || !tx_exited_)
     {
-        std::lock_guard<std::mutex> lock(port_mutex_);
-        if (port_)
+        if (!rx_exited_)
         {
-            try
-            {
-                port_->close();
-            }
-            catch (const std::exception&)
-            {
-            }
+            wake_thread(rx_thread_);
         }
+        if (!tx_exited_)
+        {
+            wake_thread(tx_thread_);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
-    if (tx_thread_.joinable())
-    {
-        tx_thread_.join();
-    }
     if (rx_thread_.joinable())
     {
         rx_thread_.join();
+    }
+    if (tx_thread_.joinable())
+    {
+        tx_thread_.join();
     }
 
     // 线程都已退出，此时 close/reset 不会再和任何线程竞争
@@ -303,7 +324,7 @@ inline void serial_mcu::tx_loop()
             tx_cv_.wait(lock, [this] { return !running_ || !tx_queue_.empty(); });
             if (!running_)
             {
-                return;
+                break;
             }
             frame = std::move(tx_queue_.front());
             tx_queue_.pop_front();
@@ -331,19 +352,8 @@ inline void serial_mcu::tx_loop()
             }
             else
             {
-                // 短写会留下半帧，丢弃本帧并关端口，让阻塞中的 RX 线程醒来重连
                 tx_dropped_++;
                 connected_ = false;
-                try
-                {
-                    if (port_ && port_->is_open())
-                    {
-                        port_->close();
-                    }
-                }
-                catch (const std::exception&)
-                {
-                }
                 std::cerr << "[serial_mcu] partial write: " << sent << " / "
                           << frame.size() << std::endl;
             }
@@ -352,23 +362,22 @@ inline void serial_mcu::tx_loop()
         {
             if (!running_)
             {
-                return;
+                break;
             }
             tx_dropped_++;
             connected_ = false;
-            try
-            {
-                if (port_ && port_->is_open())
-                {
-                    port_->close();
-                }
-            }
-            catch (const std::exception&)
-            {
-            }
             std::cerr << "[serial_mcu] send failed: " << e.what() << std::endl;
         }
+
+        // 关闭和重连交给 RX 线程（它独占 port_ 的生命周期），这里只负责把可能
+        // 阻塞在 receive() 里的它叫醒
+        if (!connected_)
+        {
+            wake_thread(rx_thread_);
+        }
     }
+
+    tx_exited_ = true;
 }
 
 inline void serial_mcu::rx_loop()
@@ -379,7 +388,11 @@ inline void serial_mcu::rx_loop()
     {
         if (!connected_)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            // 分片睡眠，析构时能在 10ms 内响应
+            for (int i = 0; i < 20 && running_; ++i)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
             if (!running_)
             {
                 break;
@@ -408,11 +421,16 @@ inline void serial_mcu::rx_loop()
             {
                 break;
             }
-            connected_ = false;
-            std::cerr << "[serial_mcu] receive failed: " << e.what() << std::endl;
+            // 若 TX 已经先判定断链，这里的 EINTR 只是被叫醒来重连，不必再报一次错
+            if (connected_.exchange(false))
+            {
+                std::cerr << "[serial_mcu] receive failed: " << e.what() << std::endl;
+            }
             close_port();
         }
     }
+
+    rx_exited_ = true;
 }
 
 inline bool serial_mcu::serial_send(uint8_t frame_id, const void* data, uint8_t data_len)

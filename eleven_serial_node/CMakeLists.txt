@@ -20,8 +20,14 @@ target_link_libraries(eleven_serial_node INTERFACE
   ${serial_driver_LIBRARIES}
   Threads::Threads)
 
+# 链路测试程序：固定频率发送测试帧
+add_executable(serial_link_test src/serial_link_test.cpp)
+target_link_libraries(serial_link_test eleven_serial_node)
+
 install(DIRECTORY include/
   DESTINATION include)
+install(TARGETS serial_link_test
+  DESTINATION lib/${PROJECT_NAME})
 install(TARGETS eleven_serial_node
   EXPORT eleven_serial_node_targets)
 install(EXPORT eleven_serial_node_targets
