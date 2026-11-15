@@ -1,13 +1,16 @@
 // 串口链路测试：以固定频率发送 3 个 float + 时间戳 + 序号，验证收发是否正常。
+// 每发一帧打印 [tx]，每收到一帧解析内容并打印 [rx]。
 // 用法：serial_link_test <port> [hz]，默认 100Hz。
 
 #include <eleven_serial_node/serial_mcu.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -23,7 +26,7 @@ void handle_sigint(int)
 }
 
 // 与 MCU 约定的业务帧 ID，按固件实际值修改
-constexpr uint8_t kFrameId = 0x02;
+constexpr uint8_t kFrameId = 0x01;
 
 // 三个固定测试值，按需修改
 constexpr float kTestX = 1.0f;
@@ -49,6 +52,62 @@ uint32_t now_ms()
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
+}
+
+void print_sent(const pose_payload& p, bool queued)
+{
+    std::cout << "[tx] id=" << static_cast<unsigned>(kFrameId)
+              << " len=" << sizeof(pose_payload)
+              << " x=" << p.x << " y=" << p.y << " yaw=" << p.yaw
+              << " stamp=" << p.stamp_ms << " seq=" << p.seq;
+    if (!queued)
+    {
+        std::cout << " [ENQUEUE FAILED]";
+    }
+    std::cout << '\n';
+}
+
+// 返回 false 只表示“本测试的位姿帧字段对不上”；其他 ID/长度的帧返回 true。
+bool print_received(const Eleven::received_frame& frame)
+{
+    std::cout << "[rx] id=" << static_cast<unsigned>(frame.id)
+              << " len=" << static_cast<unsigned>(frame.len);
+
+    if (frame.id == kFrameId && frame.len == sizeof(pose_payload))
+    {
+        const float x = frame.as_float(0);
+        const float y = frame.as_float(1);
+        const float yaw = frame.as_float(2);
+        const uint32_t stamp_ms = frame.as_u32(3);
+        const uint32_t seq = frame.as_u32(4);
+
+        std::cout << " x=" << x << " y=" << y << " yaw=" << yaw
+                  << " stamp=" << stamp_ms << " seq=" << seq;
+
+        const bool ok = std::fabs(x - kTestX) < 1e-4f &&
+                        std::fabs(y - kTestY) < 1e-4f &&
+                        std::fabs(yaw - kTestYawDeg) < 1e-4f;
+        if (!ok)
+        {
+            std::cout << " [MISMATCH]";
+        }
+        std::cout << '\n';
+        return ok;
+    }
+
+    // 其他 ID 或长度：按原始字节打印，便于接 MCU 时观察上行帧
+    std::cout << " data=";
+    const auto flags = std::cout.flags();
+    const char fill = std::cout.fill();
+    for (unsigned i = 0; i < frame.len; ++i)
+    {
+        std::cout << std::hex << std::setw(2) << std::setfill('0')
+                  << static_cast<unsigned>(frame.data[i]) << ' ';
+    }
+    std::cout.flags(flags);
+    std::cout.fill(fill);
+    std::cout << '\n';
+    return true;
 }
 
 }  // namespace
@@ -83,6 +142,7 @@ int main(int argc, char** argv)
 
     uint32_t seq = 0;
     uint64_t rx_count = 0;
+    uint64_t rx_bad = 0;
     pose_payload payload{};
 
     while (g_running)
@@ -93,25 +153,29 @@ int main(int argc, char** argv)
         payload.stamp_ms = now_ms();
         payload.seq = seq++;
 
-        if (!link.serial_send(kFrameId, &payload, sizeof(payload)))
-        {
-            std::cerr << "send failed: payload too large or link not running\n";
-        }
+        const bool queued = link.serial_send(kFrameId, &payload, sizeof(payload));
+        print_sent(payload, queued);
 
         Eleven::received_frame frame;
         while (link.serial_read(frame))
         {
             ++rx_count;
+            if (!print_received(frame))
+            {
+                ++rx_bad;
+            }
         }
 
         if (next - last_report >= std::chrono::seconds(1))
         {
             last_report = next;
-            std::cout << "seq=" << payload.seq << " x=" << payload.x
-                      << " y=" << payload.y << " yaw=" << payload.yaw
-                      << " | tx_sent=" << link.tx_sent()
+            std::cout << "[stat] tx_sent=" << link.tx_sent()
                       << " tx_dropped=" << link.tx_dropped()
                       << " rx=" << rx_count
+                      << " rx_bad=" << rx_bad
+                      << " crc_err=" << link.rx_crc_errors()
+                      << " resync=" << link.rx_resync_bytes()
+                      << " rx_drop=" << link.rx_dropped()
                       << " open=" << link.isOpen() << '\n';
         }
 
@@ -125,6 +189,7 @@ int main(int argc, char** argv)
 
     std::cout << "stopped: tx_sent=" << link.tx_sent()
               << " tx_dropped=" << link.tx_dropped()
-              << " rx=" << rx_count << '\n';
+              << " rx=" << rx_count
+              << " rx_bad=" << rx_bad << '\n';
     return 0;
 }
